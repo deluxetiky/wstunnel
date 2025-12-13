@@ -447,6 +447,7 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
             server_config.transport_config(Arc::new(transport));
 
             let quic_bind_addr = self.config.quic_listen.unwrap_or(self.config.bind);
+            info!("Starting QUIC server listening on UDP {}", quic_bind_addr);
             let endpoint = Endpoint::server(server_config, quic_bind_addr)?;
 
             let server = self.clone();

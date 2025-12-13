@@ -169,13 +169,22 @@ pub async fn connect(
         .tls()
         .ok_or_else(|| anyhow!("QUIC requires TLS configuration"))?;
 
+    let (tls_client_certificate, tls_client_key) =
+        if let (Some(cert_path), Some(key_path)) = (&tls_config.tls_certificate_path, &tls_config.tls_key_path) {
+            let certs = tls::load_certificates_from_pem(cert_path).context("Cannot load client TLS certificate")?;
+            let key = tls::load_private_key_from_file(key_path).context("Cannot load client TLS private key")?;
+            (Some(certs), Some(key))
+        } else {
+            (None, None)
+        };
+
     let rustls_config = tls::rustls_client_config(
         tls_config.tls_verify_certificate,
         vec![b"h3".to_vec()],
         !tls_config.tls_sni_disabled,
         None, // ECH not piped through yet
-        None, // Client certs not piped through yet
-        None,
+        tls_client_certificate,
+        tls_client_key,
     )?;
 
     let mut client_config =
