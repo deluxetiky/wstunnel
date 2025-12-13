@@ -4,27 +4,76 @@ use crate::protocols::dns::DnsResolver;
 use crate::restrictions::types;
 use crate::restrictions::types::{AllowConfig, MatchConfig, RestrictionConfig, RestrictionsRules};
 use crate::somark::SoMark;
-use crate::tunnel::client::{WsClient, WsClientConfig};
+use crate::tunnel::client::{TlsClientConfig, WsClient, WsClientConfig};
 use crate::tunnel::listeners::{TcpTunnelListener, UdpTunnelListener};
-use crate::tunnel::server::{WsServer, WsServerConfig};
+use crate::tunnel::server::{TlsServerConfig, WsServer, WsServerConfig};
 use crate::tunnel::transport::{TransportAddr, TransportScheme};
 use bytes::BytesMut;
 use futures_util::StreamExt;
 use hyper::http::HeaderValue;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use parking_lot::{Mutex, RwLock};
+use rcgen::generate_simple_self_signed;
 use rstest::{fixture, rstest};
 use scopeguard::defer;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::pin;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use url::Host;
 
 #[fixture]
 fn dns_resolver() -> DnsResolver {
+    protocols::tls::init();
     DnsResolver::new_from_urls(&[], None, SoMark::new(None), true).expect("Cannot create DNS resolver")
+}
+
+fn generate_tls_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    let subject_alt_names = vec!["127.0.0.1".to_string(), "localhost".to_string()];
+    let cert = generate_simple_self_signed(subject_alt_names).unwrap();
+    let key_pair = cert.signing_key.serialized_der().to_vec();
+    let cert = cert.cert.der().to_vec();
+
+    let cert = CertificateDer::from(cert);
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair));
+    (vec![cert], key)
+}
+
+#[fixture]
+fn tls_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    generate_tls_cert()
+}
+
+#[fixture]
+fn server_quic(
+    dns_resolver: DnsResolver,
+    #[from(tls_cert)] cert_key: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
+) -> WsServer {
+    let (cert, key) = cert_key;
+    let server_config = WsServerConfig {
+        socket_so_mark: SoMark::new(None),
+        bind: "127.0.0.1:8080".parse().unwrap(),
+        websocket_ping_frequency: Some(Duration::from_secs(10)),
+        timeout_connect: Duration::from_secs(10),
+        websocket_mask_frame: false,
+        tls: Some(TlsServerConfig {
+            tls_certificate: Mutex::new(cert),
+            tls_key: Mutex::new(key),
+            tls_client_ca_certificates: None,
+            tls_certificate_path: None,
+            tls_key_path: None,
+            tls_client_ca_certs_path: None,
+        }),
+        dns_resolver,
+        restriction_config: None,
+        http_proxy: None,
+        remote_server_idle_timeout: Duration::from_secs(30),
+    };
+    WsServer::new(server_config, DefaultTokioExecutor::default())
 }
 
 #[fixture]
@@ -49,6 +98,60 @@ async fn client_ws(dns_resolver: DnsResolver) -> WsClient {
     let client_config = WsClientConfig {
         remote_addr: TransportAddr::new(TransportScheme::Ws, Host::Ipv4("127.0.0.1".parse().unwrap()), 8080, None)
             .unwrap(),
+        socket_so_mark: SoMark::new(None),
+        http_upgrade_path_prefix: "wstunnel".to_string(),
+        http_upgrade_credentials: None,
+        http_headers: HashMap::new(),
+        http_headers_file: None,
+        http_header_host: HeaderValue::from_static("127.0.0.1:8080"),
+        timeout_connect: Duration::from_secs(10),
+        websocket_ping_frequency: Some(Duration::from_secs(10)),
+        websocket_mask_frame: false,
+        dns_resolver,
+        http_proxy: None,
+    };
+
+    WsClient::new(
+        client_config,
+        1,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        DefaultTokioExecutor::default(),
+    )
+    .await
+    .unwrap()
+}
+
+#[fixture]
+async fn client_quic(
+    dns_resolver: DnsResolver,
+    #[from(tls_cert)] cert_key: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
+) -> WsClient {
+    let (cert, _) = cert_key;
+    let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+    for c in cert {
+        root_store.add(c).unwrap();
+    }
+
+    let client_config = tokio_rustls::rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let client_config = WsClientConfig {
+        remote_addr: TransportAddr::new(
+            TransportScheme::Quic,
+            Host::Ipv4("127.0.0.1".parse().unwrap()),
+            8080,
+            Some(TlsClientConfig {
+                tls_sni_disabled: false,
+                tls_sni_override: None,
+                tls_verify_certificate: true,
+                tls_connector: Arc::new(RwLock::new(tokio_rustls::TlsConnector::from(Arc::new(client_config)))),
+                tls_certificate_path: None,
+                tls_key_path: None,
+            }),
+        )
+        .unwrap(),
         socket_so_mark: SoMark::new(None),
         http_upgrade_path_prefix: "wstunnel".to_string(),
         http_upgrade_credentials: None,
@@ -129,6 +232,51 @@ async fn test_tcp_tunnel(
     defer! { server_h.abort(); };
 
     let client_ws = client_ws.await;
+
+    let server = TcpTunnelListener::new(TUNNEL_LISTEN.0, (ENDPOINT_LISTEN.1, ENDPOINT_LISTEN.0.port()), false)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        client_ws.run_tunnel(server).await.unwrap();
+    });
+
+    let mut tcp_listener = protocols::tcp::run_server(ENDPOINT_LISTEN.0, false).await.unwrap();
+    let mut client = protocols::tcp::connect(
+        &TUNNEL_LISTEN.1,
+        TUNNEL_LISTEN.0.port(),
+        SoMark::new(None),
+        Duration::from_secs(10),
+        &dns_resolver,
+    )
+    .await
+    .unwrap();
+
+    client.write_all(b"Hello").await.unwrap();
+    let mut dd = tcp_listener.next().await.unwrap().unwrap();
+    let mut buf = BytesMut::new();
+    dd.read_buf(&mut buf).await.unwrap();
+    assert_eq!(&buf[..5], b"Hello");
+    buf.clear();
+
+    dd.write_all(b"world!").await.unwrap();
+    client.read_buf(&mut buf).await.unwrap();
+    assert_eq!(&buf[..6], b"world!");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_quic_tunnel(
+    #[future] client_quic: WsClient,
+    server_quic: WsServer,
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+) {
+    let server_h = tokio::spawn(server_quic.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    let client_ws = client_quic.await;
 
     let server = TcpTunnelListener::new(TUNNEL_LISTEN.0, (ENDPOINT_LISTEN.1, ENDPOINT_LISTEN.0.port()), false)
         .await

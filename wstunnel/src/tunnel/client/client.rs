@@ -82,6 +82,11 @@ impl<E: TokioExecutorRef> WsClient<E> {
                     .await
                     .map(|(r, w, response)| (TunnelReader::Http2(r), TunnelWriter::Http2(w), response))?
             }
+            TransportScheme::Quic | TransportScheme::Quics => {
+                tunnel::transport::quic::connect(request_id, self, remote_cfg)
+                    .await
+                    .map(|(r, w, response)| (TunnelReader::Quic(r), TunnelWriter::Quic(w), response))?
+            }
         };
 
         debug!("Server response: {response:?}");
@@ -182,6 +187,20 @@ impl<E: TokioExecutorRef> WsClient<E> {
                         .await
                     {
                         Ok((r, w, response)) => (TunnelReader::Http2(r), TunnelWriter::Http2(w), response),
+                        Err(err) => {
+                            let reconnect_delay = reconnect_delay();
+                            event!(parent: &span, Level::ERROR, "Retrying in {:?}, cannot connect to remote server: {:?}", reconnect_delay, err);
+                            tokio::time::sleep(reconnect_delay).await;
+                            continue;
+                        }
+                    }
+                }
+                TransportScheme::Quic | TransportScheme::Quics => {
+                    match tunnel::transport::quic::connect(request_id, &client, &remote_addr)
+                        .instrument(span.clone())
+                        .await
+                    {
+                        Ok((r, w, response)) => (TunnelReader::Quic(r), TunnelWriter::Quic(w), response),
                         Err(err) => {
                             let reconnect_delay = reconnect_delay();
                             event!(parent: &span, Level::ERROR, "Retrying in {:?}, cannot connect to remote server: {:?}", reconnect_delay, err);

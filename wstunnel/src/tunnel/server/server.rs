@@ -16,10 +16,12 @@ use crate::tunnel::server::utils::{
     extract_x_forwarded_for, find_mapped_port, validate_tunnel,
 };
 use crate::tunnel::tls_reloader::TlsReloader;
+use crate::tunnel::transport::quic::{QuicTunnelRead, QuicTunnelWrite};
 use crate::tunnel::{LocalProtocol, RemoteAddr, try_to_sock_addr};
 use ahash::AHasher;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
+use bytes::BytesMut;
 use http_body_util::Either;
 use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
@@ -27,6 +29,7 @@ use hyper::service::service_fn;
 use hyper::{Request, StatusCode, Version, http};
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use parking_lot::Mutex;
+use quinn::Endpoint;
 use socket2::SockRef;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
@@ -80,13 +83,13 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
         }
     }
 
-    pub(super) async fn handle_tunnel_request(
+    pub(super) async fn handle_tunnel_request<B>(
         &self,
         restrictions: Arc<RestrictionsRules>,
         restrict_path_prefix: Option<String>,
         cert_vars: &CertificateVars,
         mut client_addr: SocketAddr,
-        req: &Request<Incoming>,
+        req: &Request<B>,
     ) -> Result<
         (
             RemoteAddr,
@@ -431,6 +434,153 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
 
         // Bind server and run forever to serve incoming connections.
         let restrictions = RestrictionsRulesReloader::new(restrictions, self.config.restriction_config.clone())?;
+
+        if let Some(tls_config) = &self.config.tls {
+            let server_config = tls::rustls_server_config(tls_config, Some(vec![b"h3".to_vec()]))?;
+            let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_config)?,
+            ));
+            let mut transport = quinn::TransportConfig::default();
+            transport.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+            transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+            server_config.transport_config(Arc::new(transport));
+
+            let endpoint = Endpoint::server(server_config, self.config.bind)?;
+
+            let server = self.clone();
+            let restrictions = restrictions.clone();
+            self.executor.spawn(async move {
+                while let Some(conn) = endpoint.accept().await {
+                    let server_clone = server.clone();
+                    let restrictions = restrictions.clone();
+                    server.executor.spawn(async move {
+                        let server = server_clone;
+                        let connection = match conn.await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!("QUIC connection error: {:?}", e);
+                                return;
+                            }
+                        };
+                        let client_addr = connection.remote_address();
+
+                        let (mut send, mut recv) = match connection.accept_bi().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("QUIC stream error: {:?}", e);
+                                return;
+                            }
+                        };
+
+                        let mut buf = BytesMut::new();
+
+                        loop {
+                            let mut header_buf = [httparse::EMPTY_HEADER; 64];
+                            let chunk = match recv.read_chunk(4096, true).await {
+                                Ok(Some(chunk)) => chunk,
+                                Ok(None) => return,
+                                Err(e) => {
+                                    warn!("QUIC read error: {:?}", e);
+                                    return;
+                                }
+                            };
+                            buf.extend_from_slice(&chunk.bytes);
+
+                            let parse_result = {
+                                let mut req = httparse::Request::new(&mut header_buf);
+                                match req.parse(&buf) {
+                                    Ok(httparse::Status::Complete(size)) => {
+                                        let mut builder = Request::builder()
+                                            .method(req.method.unwrap())
+                                            .uri(req.path.unwrap())
+                                            .version(Version::HTTP_11);
+
+                                        for h in req.headers {
+                                            builder = builder.header(h.name, h.value);
+                                        }
+
+                                        let req = builder.body(()).unwrap();
+                                        Ok(Some((req, size)))
+                                    }
+                                    Ok(httparse::Status::Partial) => Ok(None),
+                                    Err(e) => Err(e),
+                                }
+                            };
+
+                            match parse_result {
+                                Ok(Some((req, size))) => {
+                                    // Extract cert vars from QUIC connection if possible
+                                    let cert_vars = crate::protocols::tls::CertificateVars::default();
+
+                                    let restrictions = restrictions.restrictions_rules().load().clone();
+
+                                    let (remote_addr, local_rx, local_tx, _inject_cookie) = match server
+                                        .handle_tunnel_request(restrictions, None, &cert_vars, client_addr, &req)
+                                        .await
+                                    {
+                                        Ok(r) => r,
+                                        Err(resp) => {
+                                            warn!("Request rejected: {:?}", resp);
+                                            // TODO: send response
+                                            return;
+                                        }
+                                    };
+
+                                    let response = "HTTP/1.1 200 OK\r\n\r\n";
+                                    if let Err(e) = send.write_all(response.as_bytes()).await {
+                                        warn!("QUIC write error: {:?}", e);
+                                        return;
+                                    }
+
+                                    let extra_bytes = if buf.len() > size {
+                                        Some(buf.split_off(size).freeze())
+                                    } else {
+                                        None
+                                    };
+
+                                    let tunnel_read = QuicTunnelRead::new(recv).with_pre_read(extra_bytes);
+                                    let tunnel_write = QuicTunnelWrite::new(send);
+
+                                    let span = span!(
+                                        Level::INFO,
+                                        "tunnel",
+                                        id = tracing::field::Empty,
+                                        remote = format!("{}:{}", remote_addr.host, remote_addr.port)
+                                    );
+
+                                    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+
+                                    server.executor.spawn(
+                                        crate::tunnel::transport::io::propagate_local_to_remote(
+                                            local_rx,
+                                            tunnel_write,
+                                            close_tx,
+                                            server.config.websocket_ping_frequency,
+                                        )
+                                        .instrument(span.clone()),
+                                    );
+
+                                    let _ = crate::tunnel::transport::io::propagate_remote_to_local(
+                                        local_tx,
+                                        tunnel_read,
+                                        close_rx,
+                                    )
+                                    .await;
+
+                                    return;
+                                }
+                                Ok(None) => continue,
+                                Err(e) => {
+                                    warn!("Invalid HTTP request: {:?}", e);
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
         let listener = TcpListener::bind(&self.config.bind)
             .await
             .with_context(|| format!("Failed to bind to socket on {}", self.config.bind))?;
