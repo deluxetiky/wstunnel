@@ -463,19 +463,21 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
                             }
                         };
                         let client_addr = connection.remote_address();
+                        let span = span!(Level::INFO, "cnx", peer = client_addr.to_string(), cn = tracing::field::Empty);
 
-                        let (mut send, mut recv) = match connection.accept_bi().await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                warn!("QUIC stream error: {:?}", e);
-                                return;
-                            }
-                        };
+                        async move {
+                            let (mut send, mut recv) = match connection.accept_bi().await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!("QUIC stream error: {:?}", e);
+                                    return;
+                                }
+                            };
 
-                        let mut buf = BytesMut::new();
+                            let mut buf = BytesMut::new();
 
-                        loop {
-                            let mut header_buf = [httparse::EMPTY_HEADER; 64];
+                            loop {
+                                let mut header_buf = [httparse::EMPTY_HEADER; 64];
                             let chunk = match recv.read_chunk(4096, true).await {
                                 Ok(Some(chunk)) => chunk,
                                 Ok(None) => return,
@@ -499,24 +501,38 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
                                             builder = builder.header(h.name, h.value);
                                         }
 
-                                        let req = builder.body(()).unwrap();
-                                        Ok(Some((req, size)))
+                                            let req = builder.body(()).unwrap();
+                                            Ok(Some((req, size)))
+                                        }
+                                        Ok(httparse::Status::Partial) => Ok(None),
+                                        Err(e) => Err(e),
                                     }
-                                    Ok(httparse::Status::Partial) => Ok(None),
-                                    Err(e) => Err(e),
-                                }
-                            };
+                                };
 
-                            match parse_result {
-                                Ok(Some((req, size))) => {
-                                    // Extract cert vars from QUIC connection if possible
-                                    let cert_vars = crate::protocols::tls::CertificateVars::default();
+                                match parse_result {
+                                    Ok(Some((req, size))) => {
+                                        // Extract cert vars from QUIC connection if possible
+                                        let cert_vars = if let Some(certs) = connection.peer_identity() {
+                                            if let Some(certs) = certs
+                                                .downcast_ref::<Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>>()
+                                            {
+                                                crate::protocols::tls::CertificateVars::from_certificate(certs)
+                                            } else {
+                                                crate::protocols::tls::CertificateVars::default()
+                                            }
+                                        } else {
+                                            crate::protocols::tls::CertificateVars::default()
+                                        };
 
-                                    let restrictions = restrictions.restrictions_rules().load().clone();
+                                        if let Some(cn) = &cert_vars.cn {
+                                            Span::current().record("cn", cn);
+                                        }
 
-                                    let (remote_addr, local_rx, local_tx, _inject_cookie) = match server
-                                        .handle_tunnel_request(restrictions, None, &cert_vars, client_addr, &req)
-                                        .await
+                                        let restrictions = restrictions.restrictions_rules().load().clone();
+
+                                        let (remote_addr, local_rx, local_tx, _inject_cookie) = match server
+                                            .handle_tunnel_request(restrictions, None, &cert_vars, client_addr, &req)
+                                            .await
                                     {
                                         Ok(r) => r,
                                         Err(resp) => {
@@ -567,15 +583,18 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
                                     )
                                     .await;
 
-                                    return;
-                                }
-                                Ok(None) => continue,
-                                Err(e) => {
-                                    warn!("Invalid HTTP request: {:?}", e);
-                                    return;
+                                        return;
+                                    }
+                                    Ok(None) => continue,
+                                    Err(e) => {
+                                        warn!("Invalid HTTP request: {:?}", e);
+                                        return;
+                                    }
                                 }
                             }
                         }
+                        .instrument(span)
+                        .await;
                     });
                 }
             });
@@ -594,7 +613,7 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
                 }
             };
 
-            let span = span!(Level::INFO, "cnx", peer = peer_addr.to_string());
+            let span = span!(Level::INFO, "cnx", peer = peer_addr.to_string(), cn = tracing::field::Empty);
             info!(parent: &span, "Accepting connection");
             if let Err(err) = protocols::tcp::configure_socket(SockRef::from(&stream), SoMark::new(None)) {
                 warn!("Error while configuring server socket {:?}", err);
@@ -623,6 +642,9 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
                         let peer_certs = tls_ctx.peer_certificates();
                         info!("TLS peer certificates present: {}", peer_certs.is_some());
                         let cert_vars = peer_certs.map(CertificateVars::from_certificate).unwrap_or_default();
+                        if let Some(cn) = &cert_vars.cn {
+                            Span::current().record("cn", cn);
+                        }
                         info!("Extracted certificate CN: {:?}", cert_vars.cn);
                         match tls_ctx.alpn_protocol() {
                             // http2
