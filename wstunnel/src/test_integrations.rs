@@ -72,6 +72,7 @@ fn server_quic(
         restriction_config: None,
         http_proxy: None,
         remote_server_idle_timeout: Duration::from_secs(30),
+        quic_listen: None,
     };
     WsServer::new(server_config, DefaultTokioExecutor::default())
 }
@@ -89,6 +90,7 @@ fn server_no_tls(dns_resolver: DnsResolver) -> WsServer {
         restriction_config: None,
         http_proxy: None,
         remote_server_idle_timeout: Duration::from_secs(30),
+        quic_listen: None,
     };
     WsServer::new(server_config, DefaultTokioExecutor::default())
 }

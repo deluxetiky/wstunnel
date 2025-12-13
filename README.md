@@ -680,6 +680,7 @@ When TLS is enabled (by using `wss://`, `https://`, or `quic[s]://`), the server
 | :--- | :--- | :--- | :--- |
 | `wss://0.0.0.0:443` | **YES** | TCP:443 **AND** UDP:443 | `wss://`, `https://`, `quic://` |
 | `quics://0.0.0.0:443` | **YES** | TCP:443 **AND** UDP:443 | `wss://`, `https://`, `quic://` |
+| `wss://0.0.0.0:443 --quic-listen 0.0.0.0:4433` | **YES** | TCP:443 **AND** UDP:4433 | `wss://`, `https://` (on 443); `quic://` (on 4433) |
 | `ws://0.0.0.0:80` | NO | TCP:80 only | `ws://`, `http://` |
 
 ### Maximize your stealthiness/Make your traffic discrete <a name="stealth"></a>

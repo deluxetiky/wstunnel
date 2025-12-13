@@ -257,6 +257,12 @@ pub struct Server {
     #[cfg_attr(feature = "clap", arg(value_name = "ws[s]|http[s]|quic[s]://0.0.0.0[:port]", value_parser = parsers::parse_server_url, verbatim_doc_comment))]
     pub remote_addr: Url,
 
+    /// [Optional] Address for the QUIC (UDP) listener to bind to.
+    /// If not provided, it defaults to the same address as the main TCP listener.
+    /// Use this to expose QUIC on a different port (e.g., direct UDP mapping) while TCP is behind a reverse proxy.
+    #[cfg_attr(feature = "clap", arg(long, value_name = "IP:PORT", verbatim_doc_comment))]
+    pub quic_listen: Option<SocketAddr>,
+
     /// (linux only) Mark network packet with SO_MARK sockoption with the specified value.
     /// You need to use {root, sudo, capabilities} to run wstunnel when using this option
     #[cfg_attr(feature = "clap", arg(long, value_name = "INT", verbatim_doc_comment))]

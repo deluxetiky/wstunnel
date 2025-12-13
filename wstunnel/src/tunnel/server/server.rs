@@ -1,4 +1,4 @@
-use crate::executor::DefaultTokioExecutor;
+use crate::executor::{DefaultTokioExecutor, TokioExecutorRef};
 use crate::protocols;
 use crate::protocols::dns::DnsResolver;
 use crate::protocols::tls;
@@ -67,10 +67,11 @@ pub struct WsServerConfig {
     pub restriction_config: Option<PathBuf>,
     pub http_proxy: Option<Url>,
     pub remote_server_idle_timeout: Duration,
+    pub quic_listen: Option<SocketAddr>,
 }
 
 #[derive(Clone)]
-pub struct WsServer<E: crate::TokioExecutorRef = DefaultTokioExecutor> {
+pub struct WsServer<E: TokioExecutorRef = DefaultTokioExecutor> {
     pub config: Arc<WsServerConfig>,
     pub executor: E,
 }
@@ -445,7 +446,8 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
             transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
             server_config.transport_config(Arc::new(transport));
 
-            let endpoint = Endpoint::server(server_config, self.config.bind)?;
+            let quic_bind_addr = self.config.quic_listen.unwrap_or(self.config.bind);
+            let endpoint = Endpoint::server(server_config, quic_bind_addr)?;
 
             let server = self.clone();
             let restrictions = restrictions.clone();

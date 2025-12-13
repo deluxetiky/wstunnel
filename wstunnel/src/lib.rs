@@ -526,6 +526,7 @@ async fn run_server_impl(args: Server, executor: impl TokioExecutorRef) -> anyho
         restriction_config: args.restrict_config,
         http_proxy,
         remote_server_idle_timeout: args.remote_to_local_server_idle_timeout,
+        quic_listen: args.quic_listen,
     };
     let server = WsServer::new(server_config, executor);
 
