@@ -115,30 +115,42 @@ impl<T: TunnelListener> ReverseTunnelServer<T> {
                 });
 
                 let mut timer = time::interval(idle_timeout);
+                let mut tx = tx;
                 pin_mut!(listening_server);
-                loop {
+                'server_loop: loop {
                     select! {
                         biased;
                         cnx = listening_server.next() => {
                            match cnx {
-                                None => break,
+                                None => break 'server_loop,
                                 Some(Err(err)) => {
                                     warn!("Error while listening for incoming connections {err:?}");
                                     continue;
                                 }
-                                Some(Ok(cnx)) => {
-                                    match time::timeout(idle_timeout, tx.send(cnx)).await {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(_)) => {
-                                            info!("All clients disconnected. Closing reverse tunnel server");
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            info!(
-                                                "New reverse connection failed to be picked by client after {}s. Closing reverse tunnel server",
-                                                idle_timeout.as_secs()
-                                            );
-                                            break;
+                                Some(Ok(mut cnx)) => {
+                                    loop {
+                                        match time::timeout(idle_timeout, tx.send(cnx)).await {
+                                            Ok(Ok(())) => break,
+                                            Ok(Err(async_channel::SendError(returned_cnx))) => {
+                                                info!("All clients disconnected. Re-creating the channel to allow reconnection");
+                                                let (new_tx, new_rx) = async_channel::bounded(10);
+                                                {
+                                                    let mut servers = server.lock();
+                                                    if let Some(item) = servers.get_mut(&local_srv2) {
+                                                        item.receiver = new_rx;
+                                                        item.nb_seen_clients.store(0, Ordering::Relaxed);
+                                                    }
+                                                }
+                                                tx = new_tx;
+                                                cnx = returned_cnx;
+                                            }
+                                            Err(_) => {
+                                                info!(
+                                                    "New reverse connection failed to be picked by client after {}s. Closing reverse tunnel server",
+                                                    idle_timeout.as_secs()
+                                                );
+                                                break 'server_loop;
+                                            }
                                         }
                                     }
                                 }
@@ -150,7 +162,7 @@ impl<T: TunnelListener> ReverseTunnelServer<T> {
                             // <= 1 because the server itself has a receiver
                             if seen_clients.swap(0, Ordering::Relaxed) == 0 && tx.receiver_count() <= 1 {
                                 info!("No client connected to reverse tunnel server for {}s. Closing reverse tunnel server", idle_timeout.as_secs());
-                                break;
+                                break 'server_loop;
                             }
                         },
                     }
