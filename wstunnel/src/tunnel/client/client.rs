@@ -293,14 +293,10 @@ impl<E: TokioExecutorRef> WsClient<E> {
 
             // IMPORTANT: We await this task instead of spawning it, so loop waits for tunnel to close
             // before creating a new one. This prevents creating 100+ concurrent tunnels for QUIC.
-            let _ = super::super::transport::io::propagate_remote_to_local(
-                local_tx,
-                ws_rx,
-                close_rx,
-                graceful_shutdown,
-            )
-            .instrument(span.clone())
-                .await;
+            let _ =
+                super::super::transport::io::propagate_remote_to_local(local_tx, ws_rx, close_rx, graceful_shutdown)
+                    .instrument(span.clone())
+                    .await;
         }
     }
 }

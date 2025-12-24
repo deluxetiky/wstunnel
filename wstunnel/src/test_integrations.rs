@@ -296,7 +296,6 @@ async fn test_tcp_tunnel(
     assert_eq!(&buf[..6], b"world!");
 }
 
-#[ignore]
 #[rstest]
 #[timeout(Duration::from_secs(40))]
 #[tokio::test]
@@ -342,7 +341,6 @@ async fn test_quic_tunnel(
     assert_eq!(&buf[..6], b"world!");
 }
 
-#[ignore]
 #[rstest]
 #[timeout(Duration::from_secs(40))]
 #[tokio::test]
@@ -622,7 +620,6 @@ async fn test_ws_reverse_tunnel_reconnect(
 //}
 
 #[rstest]
-#[ignore]
 #[timeout(Duration::from_secs(20))]
 #[tokio::test]
 #[serial]
