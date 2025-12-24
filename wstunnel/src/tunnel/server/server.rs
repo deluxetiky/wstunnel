@@ -37,7 +37,9 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
+static QUIC_CONN_ID: AtomicUsize = AtomicUsize::new(0);
 use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -768,6 +770,7 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
 
                                                 info!("connected to {:?} {}:{}", remote_addr.protocol, remote_addr.host, remote_addr.port);
 
+                                                // For forward tunnels, send HTTP 200 AFTER exec_tunnel completes
                                                 // Send HTTP 200 AFTER exec_tunnel completes
                                                 debug!("QUIC server: Sending HTTP 200 AFTER exec_tunnel");
                                                 let response = "HTTP/1.1 200 OK\r\n\r\n";

@@ -189,7 +189,7 @@ impl<E: TokioExecutorRef> WsClient<E> {
         let semaphore = Arc::new(Semaphore::new(self.reverse_tunnel_concurrency));
 
         loop {
-            let permit = match semaphore.clone().acquire_owned().await {
+            let _permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => break Ok(()),
             };
@@ -291,18 +291,16 @@ impl<E: TokioExecutorRef> WsClient<E> {
                 }
             };
 
-            self.executor.spawn(async move {
-                // Hold onto the permit until the tunnel is closed
-                let _permit = permit;
-                let _ = super::super::transport::io::propagate_remote_to_local(
-                    local_tx,
-                    ws_rx,
-                    close_rx,
-                    graceful_shutdown,
-                )
-                .instrument(span.clone())
+            // IMPORTANT: We await this task instead of spawning it, so loop waits for tunnel to close
+            // before creating a new one. This prevents creating 100+ concurrent tunnels for QUIC.
+            let _ = super::super::transport::io::propagate_remote_to_local(
+                local_tx,
+                ws_rx,
+                close_rx,
+                graceful_shutdown,
+            )
+            .instrument(span.clone())
                 .await;
-            });
         }
     }
 }
