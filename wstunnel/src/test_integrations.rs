@@ -1163,3 +1163,82 @@ async fn test_quic_reverse_tunnel_concurrency(
         h.await.unwrap();
     }
 }
+
+#[rstest]
+#[timeout(Duration::from_secs(20))]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_quic_clean_shutdown_and_restart(
+    #[future] client_quic: WsClient,
+    server_quic: WsServer,
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+) {
+    let server_h = tokio::spawn(server_quic.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    let client_ws = client_quic.await;
+
+    let server = TcpTunnelListener::new(TUNNEL_LISTEN.0, (ENDPOINT_LISTEN.1, ENDPOINT_LISTEN.0.port()), false)
+        .await
+        .unwrap();
+
+    // 1. Run tunnel
+    let c1 = client_ws.clone();
+    let t1 = tokio::spawn(async move {
+        c1.run_tunnel(server).await.unwrap();
+    });
+
+    // 2. Connect and verify it works
+    let mut tcp_listener = protocols::tcp::run_server(ENDPOINT_LISTEN.0, false).await.unwrap();
+    let mut client = protocols::tcp::connect(
+        &TUNNEL_LISTEN.1,
+        TUNNEL_LISTEN.0.port(),
+        SoMark::new(None),
+        Duration::from_secs(5),
+        &dns_resolver,
+    )
+    .await
+    .unwrap();
+
+    client.write_all(b"Ping").await.unwrap();
+    let mut dd = tcp_listener.next().await.unwrap().unwrap();
+    let mut buf = vec![0u8; 4];
+    dd.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"Ping");
+
+    // 3. Drop client connection to close the tunnel stream
+    drop(client);
+    drop(dd);
+
+    // 4. Abort tunnel task (simulate client shutdown/crash)
+    t1.abort();
+    // Allow some time for cleanup propagation
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 5. Start new tunnel (simulate restart)
+    let server2 = TcpTunnelListener::new(TUNNEL_LISTEN.0, (ENDPOINT_LISTEN.1, ENDPOINT_LISTEN.0.port()), false)
+        .await
+        .unwrap();
+
+    let c2 = client_ws.clone();
+    tokio::spawn(async move {
+        c2.run_tunnel(server2).await.unwrap();
+    });
+
+    // 6. Connect again
+    let mut client2 = protocols::tcp::connect(
+        &TUNNEL_LISTEN.1,
+        TUNNEL_LISTEN.0.port(),
+        SoMark::new(None),
+        Duration::from_secs(5),
+        &dns_resolver,
+    )
+    .await
+    .unwrap();
+
+    client2.write_all(b"Pong").await.unwrap();
+    let mut dd2 = tcp_listener.next().await.unwrap().unwrap();
+    dd2.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"Pong");
+}

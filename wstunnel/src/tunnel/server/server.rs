@@ -634,7 +634,22 @@ impl<E: crate::TokioExecutorRef> WsServer<E> {
                                         s
                                     }
                                     Err(e) => {
-                                        warn!("QUIC stream accept error on connection {}: {:?}", conn_id, e);
+                                        match e {
+                                            quinn::ConnectionError::ApplicationClosed(ref app_err)
+                                                if app_err.error_code == 0u32.into() =>
+                                            {
+                                                debug!(
+                                                    "QUIC connection closed by client (clean shutdown): {:?}",
+                                                    e
+                                                );
+                                            }
+                                            quinn::ConnectionError::LocallyClosed => {
+                                                debug!("QUIC connection closed locally");
+                                            }
+                                            _ => {
+                                                warn!("QUIC stream accept error on connection {}: {:?}", conn_id, e);
+                                            }
+                                        }
                                         return;
                                     }
                                 };
