@@ -37,8 +37,6 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
-static QUIC_CONN_ID: AtomicUsize = AtomicUsize::new(0);
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
