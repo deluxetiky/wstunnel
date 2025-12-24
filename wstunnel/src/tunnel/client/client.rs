@@ -108,7 +108,7 @@ impl<E: TokioExecutorRef> WsClient<E> {
                     .map(|(r, w, response)| (TunnelReader::Http2(r), TunnelWriter::Http2(w), response))?
             }
             TransportScheme::Quic | TransportScheme::Quics => {
-                tunnel::transport::quic::connect(request_id, self, remote_cfg, false)
+                tunnel::transport::quic::connect(request_id, self, remote_cfg, true)
                     .await
                     .map(|(r, w, response)| (TunnelReader::Quic(r), TunnelWriter::Quic(w), response))?
             }
