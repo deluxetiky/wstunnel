@@ -9,39 +9,40 @@ use crate::somark::SoMark;
 use crate::tunnel::RemoteAddr;
 use crate::tunnel::connectors::TunnelConnector;
 
-pub struct UdpTunnelConnector<'a> {
-    host: &'a Host,
+#[derive(Clone)]
+pub struct UdpTunnelConnector {
+    host: Host,
     port: u16,
     so_mark: SoMark,
     connect_timeout: Duration,
-    dns_resolver: &'a DnsResolver,
+    dns_resolver: DnsResolver,
 }
 
-impl<'a> UdpTunnelConnector<'a> {
+impl UdpTunnelConnector {
     pub fn new(
-        host: &'a Host,
+        host: &Host,
         port: u16,
         so_mark: SoMark,
         connect_timeout: Duration,
-        dns_resolver: &'a DnsResolver,
-    ) -> UdpTunnelConnector<'a> {
+        dns_resolver: &DnsResolver,
+    ) -> UdpTunnelConnector {
         UdpTunnelConnector {
-            host,
+            host: host.clone(),
             port,
             so_mark,
             connect_timeout,
-            dns_resolver,
+            dns_resolver: dns_resolver.clone(),
         }
     }
 }
 
-impl TunnelConnector for UdpTunnelConnector<'_> {
+impl TunnelConnector for UdpTunnelConnector {
     type Reader = WsUdpSocket;
     type Writer = WsUdpSocket;
 
     async fn connect(&self, _: &Option<RemoteAddr>) -> anyhow::Result<(Self::Reader, Self::Writer)> {
         let stream =
-            protocols::udp::connect(self.host, self.port, self.connect_timeout, self.so_mark, self.dns_resolver)
+            protocols::udp::connect(&self.host, self.port, self.connect_timeout, self.so_mark, &self.dns_resolver)
                 .await?;
 
         Ok((stream.clone(), stream))

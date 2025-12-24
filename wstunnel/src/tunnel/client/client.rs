@@ -10,6 +10,7 @@ use crate::tunnel::tls_reloader::TlsReloader;
 use crate::tunnel::transport::io::{TunnelReader, TunnelWriter};
 use crate::tunnel::transport::{TransportScheme, jwt_token_to_tunnel};
 use anyhow::Context;
+use bb8::ManageConnection;
 use futures_util::pin_mut;
 use hyper::header::COOKIE;
 use log::debug;
@@ -18,7 +19,7 @@ use std::cmp::min;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio_stream::StreamExt;
 use tracing::{Instrument, Level, Span, error, event, span};
 use url::Host;
@@ -165,11 +166,10 @@ impl<E: TokioExecutorRef> WsClient<E> {
         Ok(())
     }
 
-    pub async fn run_reverse_tunnel(
-        self,
-        remote_addr: RemoteAddr,
-        connector: impl TunnelConnector,
-    ) -> anyhow::Result<()> {
+    pub async fn run_reverse_tunnel<C>(self, remote_addr: RemoteAddr, connector: C) -> anyhow::Result<()>
+    where
+        C: TunnelConnector + Clone + Send + Sync + 'static,
+    {
         fn new_reconnect_delay(max_delay: Duration) -> impl FnMut() -> Duration {
             let mut reconnect_delay = Duration::from_secs(1);
 
@@ -184,119 +184,246 @@ impl<E: TokioExecutorRef> WsClient<E> {
             }
         }
 
-        let mut reconnect_delay = new_reconnect_delay(self.reverse_tunnel_connection_retry_max_backoff);
         // Limit the number of concurrent reverse tunnels
         let semaphore = Arc::new(Semaphore::new(self.reverse_tunnel_concurrency));
 
+        // For QUIC reverse tunnels, keep a single QUIC connection warm and open new streams on it.
+        // This reduces “gaps” (DNS+TLS+QUIC handshake) between reverse tunnel sessions and helps
+        // avoid stale/half-broken reconnect cycles.
+        let shared_quic_cnx: Option<Arc<Mutex<Option<quinn::Connection>>>> = match self.config.remote_addr.scheme() {
+            TransportScheme::Quic | TransportScheme::Quics => Some(Arc::new(Mutex::new(None))),
+            _ => None,
+        };
+
         loop {
-            let _permit = match semaphore.clone().acquire_owned().await {
+            let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => break Ok(()),
             };
 
             let client = self.clone();
-            let request_id = Uuid::now_v7();
-            let span = span!(
-                Level::INFO,
-                "tunnel",
-                id = request_id.to_string(),
-                remote = format!("{}:{}", remote_addr.host, remote_addr.port)
-            );
-            event!(parent: &span, Level::DEBUG, "Reverse tunnel: Starting connection attempt with scheme {:?}", client.config.remote_addr.scheme());
-            // Correctly configure tunnel cfg
-            let (ws_rx, ws_tx, response) = match client.config.remote_addr.scheme() {
-                TransportScheme::Ws | TransportScheme::Wss => {
-                    match tunnel::transport::websocket::connect(request_id, &client, &remote_addr)
-                        .instrument(span.clone())
-                        .await
-                    {
-                        Ok((r, w, response)) => (TunnelReader::Websocket(r), TunnelWriter::Websocket(w), response),
-                        Err(err) => {
-                            let reconnect_delay = reconnect_delay();
-                            event!(parent: &span, Level::ERROR, "Retrying in {:?}, cannot connect to remote server: {:?}", reconnect_delay, err);
-                            tokio::time::sleep(reconnect_delay).await;
-                            continue;
-                        }
-                    }
-                }
-                TransportScheme::Http | TransportScheme::Https => {
-                    match tunnel::transport::http2::connect(request_id, &client, &remote_addr)
-                        .instrument(span.clone())
-                        .await
-                    {
-                        Ok((r, w, response)) => (TunnelReader::Http2(r), TunnelWriter::Http2(w), response),
-                        Err(err) => {
-                            let reconnect_delay = reconnect_delay();
-                            event!(parent: &span, Level::ERROR, "Retrying in {:?}, cannot connect to remote server: {:?}", reconnect_delay, err);
-                            tokio::time::sleep(reconnect_delay).await;
-                            continue;
-                        }
-                    }
-                }
-                TransportScheme::Quic | TransportScheme::Quics => {
-                    event!(parent: &span, Level::DEBUG, "Reverse tunnel: Attempting QUIC connection for request {}", request_id);
-                    match tunnel::transport::quic::connect(request_id, &client, &remote_addr, true)
-                        .instrument(span.clone())
-                        .await
-                    {
-                        Ok((r, w, response)) => {
-                            event!(parent: &span, Level::DEBUG, "Reverse tunnel: QUIC connection succeeded");
-                            (TunnelReader::Quic(r), TunnelWriter::Quic(w), response)
-                        }
-                        Err(err) => {
-                            let reconnect_delay = reconnect_delay();
-                            event!(parent: &span, Level::ERROR, "Retrying in {:?}, cannot connect to remote server: {:?}", reconnect_delay, err);
-                            tokio::time::sleep(reconnect_delay).await;
-                            continue;
-                        }
-                    }
-                }
-            };
-            reconnect_delay = new_reconnect_delay(self.reverse_tunnel_connection_retry_max_backoff);
+            let connector = connector.clone();
+            let remote_addr = remote_addr.clone();
+            let shared_quic_cnx = shared_quic_cnx.clone();
+            let mut reconnect_delay = new_reconnect_delay(self.reverse_tunnel_connection_retry_max_backoff);
 
-            // Connect to endpoint
-            event!(parent: &span, Level::DEBUG, "Server response: {:?}", response);
-            let remote = response
-                .headers
-                .get(COOKIE)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|h| jwt_token_to_tunnel(h).ok())
-                .map(|jwt| RemoteAddr {
-                    protocol: jwt.claims.p,
-                    host: Host::parse(&jwt.claims.r).unwrap_or_else(|_| Host::Domain(String::new())),
-                    port: jwt.claims.rp,
+            self.executor.spawn(async move {
+                let _permit = permit;
+                let request_id = Uuid::now_v7();
+                let span = span!(
+                    Level::INFO,
+                    "tunnel",
+                    id = request_id.to_string(),
+                    remote = format!("{}:{}", remote_addr.host, remote_addr.port)
+                );
+
+                // Connection retry loop for this slot
+                let (ws_rx, ws_tx, response) = loop {
+                    event!(
+                        parent: &span,
+                        Level::DEBUG,
+                        "Reverse tunnel: Starting connection attempt with scheme {:?}",
+                        client.config.remote_addr.scheme()
+                    );
+                    // Correctly configure tunnel cfg
+                    match client.config.remote_addr.scheme() {
+                        TransportScheme::Ws | TransportScheme::Wss => {
+                            match tunnel::transport::websocket::connect(request_id, &client, &remote_addr)
+                                .instrument(span.clone())
+                                .await
+                            {
+                                Ok((r, w, response)) => {
+                                    break (TunnelReader::Websocket(r), TunnelWriter::Websocket(w), response);
+                                }
+                                Err(err) => {
+                                    let reconnect_delay = reconnect_delay();
+                                    event!(
+                                        parent: &span,
+                                        Level::ERROR,
+                                        "Retrying in {:?}, cannot connect to remote server: {:?}",
+                                        reconnect_delay,
+                                        err
+                                    );
+                                    tokio::time::sleep(reconnect_delay).await;
+                                    continue;
+                                }
+                            }
+                        }
+                        TransportScheme::Http | TransportScheme::Https => {
+                            match tunnel::transport::http2::connect(request_id, &client, &remote_addr)
+                                .instrument(span.clone())
+                                .await
+                            {
+                                Ok((r, w, response)) => {
+                                    break (TunnelReader::Http2(r), TunnelWriter::Http2(w), response);
+                                }
+                                Err(err) => {
+                                    let reconnect_delay = reconnect_delay();
+                                    event!(
+                                        parent: &span,
+                                        Level::ERROR,
+                                        "Retrying in {:?}, cannot connect to remote server: {:?}",
+                                        reconnect_delay,
+                                        err
+                                    );
+                                    tokio::time::sleep(reconnect_delay).await;
+                                    continue;
+                                }
+                            }
+                        }
+                        TransportScheme::Quic | TransportScheme::Quics => {
+                            event!(
+                                parent: &span,
+                                Level::DEBUG,
+                                "Reverse tunnel: Attempting QUIC stream on shared connection for request {}",
+                                request_id
+                            );
+
+                            let shared = match &shared_quic_cnx {
+                                Some(s) => s.clone(),
+                                None => {
+                                    let reconnect_delay = reconnect_delay();
+                                    event!(
+                                        parent: &span,
+                                        Level::ERROR,
+                                        "Retrying in {:?}, missing shared QUIC connection state",
+                                        reconnect_delay
+                                    );
+                                    tokio::time::sleep(reconnect_delay).await;
+                                    continue;
+                                }
+                            };
+
+                            // Ensure we have a usable QUIC connection we can open streams on.
+                            let conn: quinn::Connection = loop {
+                                let mut guard = shared.lock().await;
+                                if let Some(conn) = guard.as_ref() {
+                                    if conn.close_reason().is_none() {
+                                        break conn.clone();
+                                    }
+
+                                    if let Some(reason) = conn.close_reason() {
+                                        event!(
+                                            parent: &span,
+                                            Level::WARN,
+                                            "Shared QUIC connection is closed ({:?}), creating new one",
+                                            reason
+                                        );
+                                    }
+                                    *guard = None;
+                                }
+
+                                match QuicConnection::new(client.config.clone()).connect().await {
+                                    Ok(Some(conn)) => {
+                                        *guard = Some(conn.clone());
+                                        break conn;
+                                    }
+                                    Ok(None) => {
+                                        let reconnect_delay = reconnect_delay();
+                                        event!(
+                                            parent: &span,
+                                            Level::ERROR,
+                                            "Retrying in {:?}, failed to connect to QUIC server (no connection)",
+                                            reconnect_delay
+                                        );
+                                        drop(guard);
+                                        tokio::time::sleep(reconnect_delay).await;
+                                    }
+                                    Err(err) => {
+                                        let reconnect_delay = reconnect_delay();
+                                        event!(
+                                            parent: &span,
+                                            Level::ERROR,
+                                            "Retrying in {:?}, cannot connect to QUIC server: {:?}",
+                                            reconnect_delay,
+                                            err
+                                        );
+                                        drop(guard);
+                                        tokio::time::sleep(reconnect_delay).await;
+                                    }
+                                }
+                            };
+
+                            match tunnel::transport::quic::connect_on_connection(
+                                request_id,
+                                &client,
+                                &remote_addr,
+                                &conn,
+                            )
+                            .instrument(span.clone())
+                            .await
+                            {
+                                Ok((r, w, response)) => {
+                                    event!(parent: &span, Level::DEBUG, "Reverse tunnel: QUIC stream established");
+                                    break (TunnelReader::Quic(r), TunnelWriter::Quic(w), response);
+                                }
+                                Err(err) => {
+                                    // Connection may be half-broken (NAT rebinding, path migration, idle timeout, etc.)
+                                    // Drop it so we force a full reconnect next attempt.
+                                    *shared.lock().await = None;
+
+                                    let reconnect_delay = reconnect_delay();
+                                    event!(
+                                        parent: &span,
+                                        Level::ERROR,
+                                        "Retrying in {:?}, cannot open QUIC stream to remote server: {:?}",
+                                        reconnect_delay,
+                                        err
+                                    );
+                                    tokio::time::sleep(reconnect_delay).await;
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                };
+
+                // Connect to endpoint
+                event!(parent: &span, Level::DEBUG, "Server response: {:?}", response);
+                let remote = response
+                    .headers
+                    .get(COOKIE)
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|h| jwt_token_to_tunnel(h).ok())
+                    .map(|jwt| RemoteAddr {
+                        protocol: jwt.claims.p,
+                        host: Host::parse(&jwt.claims.r).unwrap_or_else(|_| Host::Domain(String::new())),
+                        port: jwt.claims.rp,
+                    });
+
+                let (local_rx, local_tx) = match connector.connect(&remote).instrument(span.clone()).await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        event!(parent: &span, Level::ERROR, "Cannot connect to {remote:?}: {err:?}");
+                        return;
+                    }
+                };
+
+                let (close_tx, close_rx) = oneshot::channel::<()>();
+                client.executor.spawn({
+                    let ping_frequency = client.config.websocket_ping_frequency;
+                    super::super::transport::io::propagate_local_to_remote(local_rx, ws_tx, close_tx, ping_frequency)
+                        .instrument(span.clone())
                 });
 
-            let (local_rx, local_tx) = match connector.connect(&remote).instrument(span.clone()).await {
-                Ok(s) => s,
-                Err(err) => {
-                    event!(parent: &span, Level::ERROR, "Cannot connect to {remote:?}: {err:?}");
-                    continue;
-                }
-            };
+                // Forward websocket rx to local rx
+                let config = client.config.clone();
+                let graceful_shutdown = async move {
+                    if let TransportScheme::Quic | TransportScheme::Quics = config.remote_addr.scheme() {
+                        // For QUIC, we need to wait a bit before closing the tunnel to allow the client to receive the response
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                };
 
-            let (close_tx, close_rx) = oneshot::channel::<()>();
-            self.executor.spawn({
-                let ping_frequency = client.config.websocket_ping_frequency;
-                super::super::transport::io::propagate_local_to_remote(local_rx, ws_tx, close_tx, ping_frequency)
-                    .instrument(span.clone())
+                let _ = super::super::transport::io::propagate_remote_to_local(
+                    local_tx,
+                    ws_rx,
+                    close_rx,
+                    graceful_shutdown,
+                )
+                .instrument(span.clone())
+                .await;
             });
-
-            // Forward websocket rx to local rx
-            let config = client.config.clone();
-            let graceful_shutdown = async move {
-                if let TransportScheme::Quic | TransportScheme::Quics = config.remote_addr.scheme() {
-                    // For QUIC, we need to wait a bit before closing the tunnel to allow the client to receive the response
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            };
-
-            // IMPORTANT: We await this task instead of spawning it, so loop waits for tunnel to close
-            // before creating a new one. This prevents creating 100+ concurrent tunnels for QUIC.
-            let _ =
-                super::super::transport::io::propagate_remote_to_local(local_tx, ws_rx, close_rx, graceful_shutdown)
-                    .instrument(span.clone())
-                    .await;
         }
     }
 }

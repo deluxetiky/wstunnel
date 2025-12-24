@@ -16,23 +16,24 @@ use crate::somark::SoMark;
 use crate::tunnel::connectors::TunnelConnector;
 use crate::tunnel::{LocalProtocol, RemoteAddr};
 
-pub struct Socks5TunnelConnector<'a> {
+#[derive(Clone)]
+pub struct Socks5TunnelConnector {
     so_mark: SoMark,
     connect_timeout: Duration,
-    dns_resolver: &'a DnsResolver,
+    dns_resolver: DnsResolver,
 }
 
-impl Socks5TunnelConnector<'_> {
-    pub fn new(so_mark: SoMark, connect_timeout: Duration, dns_resolver: &DnsResolver) -> Socks5TunnelConnector<'_> {
+impl Socks5TunnelConnector {
+    pub fn new(so_mark: SoMark, connect_timeout: Duration, dns_resolver: &DnsResolver) -> Socks5TunnelConnector {
         Socks5TunnelConnector {
             so_mark,
             connect_timeout,
-            dns_resolver,
+            dns_resolver: dns_resolver.clone(),
         }
     }
 }
 
-impl TunnelConnector for Socks5TunnelConnector<'_> {
+impl TunnelConnector for Socks5TunnelConnector {
     type Reader = Socks5Reader;
     type Writer = Socks5Writer;
 
@@ -48,16 +49,21 @@ impl TunnelConnector for Socks5TunnelConnector<'_> {
                     remote.port,
                     self.so_mark,
                     self.connect_timeout,
-                    self.dns_resolver,
+                    &self.dns_resolver,
                 )
                 .await?;
                 let (reader, writer) = stream.into_split();
                 Ok((Socks5Reader::Tcp(reader), Socks5Writer::Tcp(writer)))
             }
             LocalProtocol::Udp { .. } => {
-                let stream =
-                    udp::connect(&remote.host, remote.port, self.connect_timeout, self.so_mark, self.dns_resolver)
-                        .await?;
+                let stream = udp::connect(
+                    &remote.host,
+                    remote.port,
+                    self.connect_timeout,
+                    self.so_mark,
+                    &self.dns_resolver,
+                )
+                .await?;
                 Ok((Socks5Reader::Udp(stream.clone()), Socks5Writer::Udp(stream)))
             }
             _ => Err(anyhow!("Invalid protocol for reverse socks5 {:?}", remote.protocol)),
@@ -81,7 +87,7 @@ impl TunnelConnector for Socks5TunnelConnector<'_> {
                     remote.port,
                     self.so_mark,
                     self.connect_timeout,
-                    self.dns_resolver,
+                    &self.dns_resolver,
                 )
                 .await?;
                 let (reader, writer) = stream.into_split();

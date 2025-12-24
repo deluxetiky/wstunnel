@@ -801,3 +801,365 @@ async fn test_ws_reverse_tunnel(
     client_sock.read_buf(&mut buf).await.unwrap();
     assert_eq!(&buf[..7], b"Success");
 }
+
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_quic_reverse_tunnel_resilience_server_restart(
+    #[future] client_quic: WsClient,
+    dns_resolver: DnsResolver,
+    #[from(tls_cert)] cert_key: (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
+    no_restrictions: RestrictionsRules,
+) {
+    let (cert, key) = cert_key;
+    let dns_resolver_clone = dns_resolver.clone();
+
+    let mk_server = move |cert: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>| {
+        let server_config = WsServerConfig {
+            socket_so_mark: SoMark::new(None),
+            bind: "127.0.0.1:8080".parse().unwrap(),
+            websocket_ping_frequency: Some(Duration::from_secs(10)),
+            timeout_connect: Duration::from_secs(10),
+            websocket_mask_frame: false,
+            tls: Some(TlsServerConfig {
+                tls_certificate: Mutex::new(cert),
+                tls_key: Mutex::new(key),
+                tls_client_ca_certificates: None,
+                tls_certificate_path: None,
+                tls_key_path: None,
+                tls_client_ca_certs_path: None,
+            }),
+            dns_resolver: dns_resolver_clone.clone(),
+            restriction_config: None,
+            http_proxy: None,
+            remote_server_idle_timeout: Duration::from_secs(30),
+            quic_listen: Some("127.0.0.1:8081".parse().unwrap()),
+            quic_initial_max_data: 1024 * 1024,
+            quic_initial_max_stream_data: 1024 * 1024,
+            quic_max_concurrent_bi_streams: 100,
+            quic_max_idle_timeout: None,
+            quic_keep_alive_interval: Duration::from_secs(10),
+            quic_socket_buffer_size: 0,
+            quic_initial_mtu: None,
+        };
+        WsServer::new(server_config, DefaultTokioExecutor::default())
+    };
+
+    let server1 = mk_server(cert.clone(), key.clone_key());
+    let server_h = tokio::spawn(server1.serve(no_restrictions.clone()));
+
+    let client_ws = client_quic.await;
+
+    let reverse_port = 9993;
+    let remote_addr = crate::tunnel::RemoteAddr {
+        protocol: crate::tunnel::LocalProtocol::ReverseTcp,
+        host: Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+        port: reverse_port,
+    };
+
+    let local_dest_port = 9992;
+    let local_dest_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), local_dest_port));
+    let mut local_server = protocols::tcp::run_server(local_dest_addr, false).await.unwrap();
+    let target_host = Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1));
+
+    let client_ws_clone = client_ws.clone();
+    let remote_addr_clone = remote_addr.clone();
+    let dns = dns_resolver.clone();
+
+    tokio::spawn(async move {
+        let connector = crate::tunnel::connectors::TcpTunnelConnector::new(
+            &target_host,
+            local_dest_port,
+            SoMark::new(None),
+            Duration::from_secs(1),
+            &dns,
+        );
+        client_ws_clone.run_reverse_tunnel(remote_addr_clone, connector).await
+    });
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    {
+        let mut client_sock = protocols::tcp::connect(
+            &Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+            reverse_port,
+            SoMark::new(None),
+            Duration::from_secs(5),
+            &dns_resolver,
+        )
+        .await
+        .unwrap();
+        client_sock.write_all(b"Init").await.unwrap();
+        let mut dd = local_server.next().await.unwrap().unwrap();
+        let mut buf = BytesMut::new();
+        dd.read_buf(&mut buf).await.unwrap();
+        assert_eq!(&buf[..4], b"Init");
+    }
+
+    server_h.abort();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let server2 = mk_server(cert, key);
+    let server_h_2 = tokio::spawn(server2.serve(no_restrictions));
+    defer! { server_h_2.abort(); };
+
+    let mut success = false;
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Ok(mut client_sock) = protocols::tcp::connect(
+            &Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+            reverse_port,
+            SoMark::new(None),
+            Duration::from_secs(1),
+            &dns_resolver,
+        )
+        .await
+            && client_sock.write_all(b"Restart").await.is_ok()
+            && let Ok(Some(Ok(mut dd))) = tokio::time::timeout(Duration::from_secs(2), local_server.next()).await
+        {
+            let mut buf = BytesMut::new();
+            if dd.read_buf(&mut buf).await.is_ok() && buf.starts_with(b"Restart") {
+                success = true;
+                break;
+            }
+        }
+    }
+    assert!(success, "Failed to reconnect after server restart");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_quic_reverse_tunnel_late_server_start(
+    #[future] client_quic: WsClient,
+    server_quic: WsServer,
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+) {
+    let client_ws = client_quic.await;
+    let reverse_port = 9991;
+    let remote_addr = crate::tunnel::RemoteAddr {
+        protocol: crate::tunnel::LocalProtocol::ReverseTcp,
+        host: Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+        port: reverse_port,
+    };
+
+    let local_dest_port = 9990;
+    let local_dest_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), local_dest_port));
+    let mut local_server = protocols::tcp::run_server(local_dest_addr, false).await.unwrap();
+    let target_host = Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1));
+
+    let client_ws_clone = client_ws.clone();
+    let remote_addr_clone = remote_addr.clone();
+    let dns = dns_resolver.clone();
+
+    tokio::spawn(async move {
+        let connector = crate::tunnel::connectors::TcpTunnelConnector::new(
+            &target_host,
+            local_dest_port,
+            SoMark::new(None),
+            Duration::from_secs(1),
+            &dns,
+        );
+        client_ws_clone.run_reverse_tunnel(remote_addr_clone, connector).await
+    });
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let server_h = tokio::spawn(server_quic.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    let mut success = false;
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Ok(mut client_sock) = protocols::tcp::connect(
+            &Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+            reverse_port,
+            SoMark::new(None),
+            Duration::from_secs(1),
+            &dns_resolver,
+        )
+        .await
+            && client_sock.write_all(b"LateStart").await.is_ok()
+            && let Ok(Some(Ok(mut dd))) = tokio::time::timeout(Duration::from_secs(2), local_server.next()).await
+        {
+            let mut buf = BytesMut::new();
+            if dd.read_buf(&mut buf).await.is_ok() && buf.starts_with(b"LateStart") {
+                success = true;
+                break;
+            }
+        }
+    }
+    assert!(success, "Failed to connect after late server start");
+}
+
+#[cfg(unix)]
+use std::path::PathBuf;
+
+#[cfg(unix)]
+struct CleanupPath(PathBuf);
+
+#[cfg(unix)]
+impl Drop for CleanupPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(unix)]
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_unix_tunnel(
+    #[future] client_ws: WsClient,
+    server_no_tls: WsServer,
+    no_restrictions: RestrictionsRules,
+    _dns_resolver: DnsResolver,
+) {
+    use crate::tunnel::listeners::UnixTunnelListener;
+    use tokio::net::UnixStream;
+
+    let server_h = tokio::spawn(server_no_tls.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    let client_ws = client_ws.await;
+
+    let tunnel_path = std::env::temp_dir().join(format!("wstunnel_test_{}.sock", uuid::Uuid::now_v7()));
+    let _cleanup = CleanupPath(tunnel_path.clone());
+
+    let server = UnixTunnelListener::new(&tunnel_path, (ENDPOINT_LISTEN.1.clone(), ENDPOINT_LISTEN.0.port()), false)
+        .await
+        .unwrap();
+
+    tokio::spawn(async move {
+        client_ws.run_tunnel(server).await.unwrap();
+    });
+
+    let mut tcp_listener = protocols::tcp::run_server(ENDPOINT_LISTEN.0, false).await.unwrap();
+
+    // Give some time for listener to be active
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = UnixStream::connect(&tunnel_path).await.unwrap();
+
+    client.write_all(b"HelloUnix").await.unwrap();
+    let mut dd = tcp_listener.next().await.unwrap().unwrap();
+    let mut buf = BytesMut::new();
+    dd.read_buf(&mut buf).await.unwrap();
+    assert_eq!(&buf[..9], b"HelloUnix");
+    buf.clear();
+
+    dd.write_all(b"ResponseUnix").await.unwrap();
+    client.read_buf(&mut buf).await.unwrap();
+    assert_eq!(&buf[..12], b"ResponseUnix");
+}
+
+#[cfg(unix)]
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_unix_tunnel_stale_cleanup() {
+    use crate::tunnel::listeners::UnixTunnelListener;
+    use std::os::unix::fs::FileTypeExt;
+
+    let tunnel_path = std::env::temp_dir().join(format!("wstunnel_test_stale_{}.sock", uuid::Uuid::now_v7()));
+    let _cleanup = CleanupPath(tunnel_path.clone());
+
+    // Create a file at the path to simulate stale socket
+    {
+        let _ = std::fs::File::create(&tunnel_path).unwrap();
+    }
+    assert!(tunnel_path.exists());
+
+    let dest = (Host::Domain("localhost".to_string()), 80);
+    let listener = UnixTunnelListener::new(&tunnel_path, dest, false).await;
+
+    assert!(listener.is_ok());
+    assert!(tunnel_path.exists());
+
+    let metadata = std::fs::metadata(&tunnel_path).unwrap();
+    assert!(metadata.file_type().is_socket());
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_quic_reverse_tunnel_concurrency(
+    #[future] client_quic: WsClient,
+    server_quic: WsServer,
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+) {
+    let server_h = tokio::spawn(server_quic.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    let client_ws = client_quic.await;
+
+    let reverse_port = 9989;
+    let remote_addr = crate::tunnel::RemoteAddr {
+        protocol: crate::tunnel::LocalProtocol::ReverseTcp,
+        host: Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+        port: reverse_port,
+    };
+
+    let local_dest_port = 9988;
+    let local_dest_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), local_dest_port));
+    let mut local_server = protocols::tcp::run_server(local_dest_addr, false).await.unwrap();
+    let target_host = Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1));
+
+    let dns = dns_resolver.clone();
+
+    // Start reverse tunnel
+    tokio::spawn(async move {
+        let connector = crate::tunnel::connectors::TcpTunnelConnector::new(
+            &target_host,
+            local_dest_port,
+            SoMark::new(None),
+            Duration::from_secs(1),
+            &dns,
+        );
+        client_ws.run_reverse_tunnel(remote_addr, connector).await
+    });
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Connect multiple times concurrently to the reverse tunnel port
+    let mut handles = vec![];
+    for i in 0..10 {
+        let dns = dns_resolver.clone();
+        handles.push(tokio::spawn(async move {
+            let mut client_sock = protocols::tcp::connect(
+                &Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+                reverse_port,
+                SoMark::new(None),
+                Duration::from_secs(5),
+                &dns,
+            )
+            .await
+            .unwrap();
+            let msg = format!("Req{}", i);
+            client_sock.write_all(msg.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; msg.len()];
+            client_sock.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, msg.as_bytes());
+        }));
+    }
+
+    // Server side handling - accept 10 connections
+    for _ in 0..10 {
+        let mut dd = local_server.next().await.unwrap().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = dd.read(&mut buf).await.unwrap();
+            dd.write_all(&buf[..n]).await.unwrap();
+        });
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+}
